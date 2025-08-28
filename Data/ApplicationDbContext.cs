@@ -12,6 +12,8 @@ public class ApplicationDbContext : DbContext
 
     public DbSet<Folder> Folders => Set<Folder>();
     public DbSet<FileEntity> Files => Set<FileEntity>();
+    public DbSet<User> Users => Set<User>();
+    public DbSet<Role> Roles => Set<Role>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -26,6 +28,11 @@ public class ApplicationDbContext : DbContext
             .WithMany(p => p.Files)
             .HasForeignKey(f => f.FolderId)
             .OnDelete(DeleteBehavior.SetNull);
+
+        modelBuilder.Entity<Role>().HasData(
+    new Role { Id = 1, Name = "Admin" },
+    new Role { Id = 2, Name = "User" }
+);
 
         base.OnModelCreating(modelBuilder);
     }
