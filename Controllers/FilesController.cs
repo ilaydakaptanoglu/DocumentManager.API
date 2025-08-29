@@ -2,12 +2,16 @@
 using DocumentManager.API.Domain.Entities;
 using DocumentManager.API.Infrastructure.Repositories;
 using DocumentManager.API.Infrastructure.Storage;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using System.Linq.Expressions;
+using System.Security.Claims;
 
 namespace DocumentManager.API.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[Authorize] // 🔒 Authentication required for all endpoints
 public class FilesController : ControllerBase
 {
     private readonly IUnitOfWork _uow;
@@ -19,14 +23,28 @@ public class FilesController : ControllerBase
         _storage = storage;
     }
 
-    // Upload
+    // Upload - with user ownership
     [HttpPost("upload")]
     [RequestSizeLimit(1073741824)] // 1GB
     public async Task<IActionResult> Upload([FromForm] List<IFormFile> files, [FromForm] int? folderId)
     {
-        if (files == null || files.Count == 0) return BadRequest("No files provided.");
+        if (files == null || files.Count == 0)
+            return BadRequest("No files provided.");
 
-        // 📌 Uploads klasörünü kontrol et ve yoksa oluştur
+        var userId = GetCurrentUserId();
+
+        // Check folder ownership if folderId is provided
+        if (folderId.HasValue)
+        {
+            var folder = await _uow.Folders.GetByIdAsync(folderId.Value);
+            if (folder == null)
+                return NotFound("Folder not found.");
+
+            // Non-admin users can only upload to their own folders
+            if (!IsAdmin() && folder.UserId != userId)
+                return Forbid("You don't have permission to upload to this folder.");
+        }
+
         var uploadsRoot = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
         if (!Directory.Exists(uploadsRoot))
         {
@@ -47,6 +65,7 @@ public class FilesController : ControllerBase
                 ContentType = f.ContentType ?? "application/octet-stream",
                 Size = f.Length,
                 FolderId = folderId,
+                UserId = userId, // 🔑 Set file owner
                 UploadedAt = DateTime.UtcNow
             };
 
@@ -69,15 +88,17 @@ public class FilesController : ControllerBase
         return Ok(results);
     }
 
-    // List (folder bazlı)
+    // List - with ownership filtering
     [HttpGet]
-    public async Task<IActionResult> List([FromQuery] string? folderId = null) // string? olarak değiştir
+    public async Task<IActionResult> List([FromQuery] string? folderId = null)
     {
         try
         {
-            // String'den int?'ye dönüştürme
-            int? parsedFolderId = null;
+            var userId = GetCurrentUserId();
+            var isAdmin = IsAdmin();
 
+            // Parse folderId
+            int? parsedFolderId = null;
             if (!string.IsNullOrEmpty(folderId) && folderId != "null")
             {
                 if (int.TryParse(folderId, out int tempId))
@@ -86,12 +107,27 @@ public class FilesController : ControllerBase
                 }
                 else
                 {
-                    return BadRequest("Geçersiz folderId formatı");
+                    return BadRequest("Invalid folderId format");
                 }
             }
 
+            // Apply ownership filter based on role
+            Expression<Func<FileEntity, bool>> filter;
+            if (isAdmin)
+            {
+                filter = parsedFolderId.HasValue
+                    ? f => f.FolderId == parsedFolderId
+                    : f => f.FolderId == null;
+            }
+            else
+            {
+                filter = parsedFolderId.HasValue
+                    ? f => f.FolderId == parsedFolderId && f.UserId == userId
+                    : f => f.FolderId == null && f.UserId == userId;
+            }
+
             var list = await _uow.Files.GetAllAsync(
-                filter: parsedFolderId.HasValue ? f => f.FolderId == parsedFolderId : f => f.FolderId == null,
+                filter: filter,
                 orderBy: q => q.OrderByDescending(x => x.UploadedAt)
             );
 
@@ -111,16 +147,23 @@ public class FilesController : ControllerBase
         }
         catch (Exception ex)
         {
-            return StatusCode(500, $"Sunucu hatası: {ex.Message}");
+            return StatusCode(500, $"Server error: {ex.Message}");
         }
     }
 
-    // Recent
+    // Recent - with ownership filtering
     [HttpGet("recent")]
     public async Task<IActionResult> Recent([FromQuery] int limit = 8)
     {
+        var userId = GetCurrentUserId();
+        var isAdmin = IsAdmin();
+
+        Expression<Func<FileEntity, bool>> filter = isAdmin
+            ? f => f.LastOpenedAt != null
+            : f => f.LastOpenedAt != null && f.UserId == userId;
+
         var list = await _uow.Files.GetAllAsync(
-            filter: f => f.LastOpenedAt != null,
+            filter: filter,
             orderBy: q => q.OrderByDescending(x => x.LastOpenedAt)
         );
 
@@ -139,54 +182,89 @@ public class FilesController : ControllerBase
         return Ok(result);
     }
 
-    // Mark as opened (Home > Son Açılanlar için)
+    // Mark as opened - with ownership check
     [HttpPatch("open/{id}")]
     public async Task<IActionResult> MarkOpened(int id)
     {
+        var userId = GetCurrentUserId();
         var entity = await _uow.Files.GetByIdAsync(id);
-        if (entity == null) return NotFound();
+
+        if (entity == null)
+            return NotFound();
+
+        if (!IsAdmin() && entity.UserId != userId)
+            return Forbid("You don't have permission to access this file.");
 
         entity.LastOpenedAt = DateTime.UtcNow;
         _uow.Files.Update(entity);
         await _uow.SaveChangesAsync();
+
         return NoContent();
     }
 
-    // Download
+    // Download - with ownership check
     [HttpGet("download/{id}")]
     public async Task<IActionResult> Download(int id)
     {
+        var userId = GetCurrentUserId();
         var entity = await _uow.Files.GetByIdAsync(id);
-        if (entity == null) return NotFound();
+
+        if (entity == null)
+            return NotFound();
+
+        if (!IsAdmin() && entity.UserId != userId)
+            return Forbid("You don't have permission to download this file.");
 
         var fileName = entity.StoredFileName;
         var uploadsRoot = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
 
-        // 📌 Yine klasörü kontrol et
         if (!Directory.Exists(uploadsRoot))
-        {
             Directory.CreateDirectory(uploadsRoot);
-        }
 
         var full = Path.Combine(uploadsRoot, fileName);
 
-        if (!System.IO.File.Exists(full)) return NotFound();
+        if (!System.IO.File.Exists(full))
+            return NotFound();
 
         return PhysicalFile(full, entity.ContentType, entity.FileName);
     }
 
-    // Delete (frontend'teki çöp kutusu için)
+    // 🗑️ SOFT DELETE - with ownership check
     [HttpDelete("{id}")]
     public async Task<IActionResult> Delete(int id)
     {
+        var userId = GetCurrentUserId();
         var entity = await _uow.Files.GetByIdAsync(id);
-        if (entity == null) return NotFound();
 
-        var ok = await _storage.DeleteAsync(entity.StoredFileName);
-        if (!ok) return StatusCode(500, "Physical file could not be deleted.");
+        if (entity == null)
+            return NotFound();
 
-        _uow.Files.Remove(entity);
+        if (!IsAdmin() && entity.UserId != userId)
+            return Forbid("You don't have permission to delete this file.");
+
+        entity.IsDeleted = true;
+        entity.DeletedAt = DateTime.UtcNow;
+
+        _uow.Files.Update(entity);
         await _uow.SaveChangesAsync();
+
         return NoContent();
+    }
+
+    // 🔧 Helper methods
+    private int GetCurrentUserId()
+    {
+        var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrEmpty(userIdClaim) || !int.TryParse(userIdClaim, out var userId))
+        {
+            throw new UnauthorizedAccessException("Invalid user ID in token");
+        }
+        return userId;
+    }
+
+    private bool IsAdmin()
+    {
+        var roleClaim = User.FindFirst(ClaimTypes.Role)?.Value;
+        return roleClaim == "Admin";
     }
 }
