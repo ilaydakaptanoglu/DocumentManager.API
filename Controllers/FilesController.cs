@@ -2,12 +2,16 @@
 using DocumentManager.API.Domain.Entities;
 using DocumentManager.API.Infrastructure.Repositories;
 using DocumentManager.API.Infrastructure.Storage;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using System.Linq.Expressions;
+using System.Security.Claims;
 
 namespace DocumentManager.API.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[Authorize] // 🔒 Authentication required
 public class FilesController : ControllerBase
 {
     private readonly IUnitOfWork _uow;
@@ -19,19 +23,25 @@ public class FilesController : ControllerBase
         _storage = storage;
     }
 
-    // Upload
     [HttpPost("upload")]
     [RequestSizeLimit(1073741824)] // 1GB
     public async Task<IActionResult> Upload([FromForm] List<IFormFile> files, [FromForm] int? folderId)
     {
-        if (files == null || files.Count == 0) return BadRequest("No files provided.");
+        if (files == null || files.Count == 0)
+            return BadRequest("No files provided.");
 
-        // 📌 Uploads klasörünü kontrol et ve yoksa oluştur
-        var uploadsRoot = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
-        if (!Directory.Exists(uploadsRoot))
+        var userId = GetCurrentUserId();
+
+        if (folderId.HasValue)
         {
-            Directory.CreateDirectory(uploadsRoot);
+            var folder = await _uow.Folders.GetByIdAsync(folderId.Value);
+            if (folder == null) return NotFound("Folder not found");
+            if (!IsAdmin() && folder.UserId != userId)
+                return Forbid("You don't have permission to upload to this folder.");
         }
+
+        var uploadsRoot = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
+        if (!Directory.Exists(uploadsRoot)) Directory.CreateDirectory(uploadsRoot);
 
         var results = new List<FileDto>();
 
@@ -47,6 +57,7 @@ public class FilesController : ControllerBase
                 ContentType = f.ContentType ?? "application/octet-stream",
                 Size = f.Length,
                 FolderId = folderId,
+                UserId = userId,
                 UploadedAt = DateTime.UtcNow
             };
 
@@ -62,36 +73,35 @@ public class FilesController : ControllerBase
                 FolderId = entity.FolderId,
                 UploadedAt = entity.UploadedAt,
                 LastOpenedAt = entity.LastOpenedAt,
-                Url = $"{Request.Scheme}://{Request.Host}{entity.RelativePath}"
+                Url = $"{Request.Scheme}://{Request.Host}/uploads/{entity.StoredFileName}"
             });
         }
 
         return Ok(results);
     }
 
-    // List (folder bazlı)
     [HttpGet]
-    public async Task<IActionResult> List([FromQuery] string? folderId = null) // string? olarak değiştir
+    public async Task<IActionResult> List([FromQuery] string? folderId = null)
     {
         try
         {
-            // String'den int?'ye dönüştürme
-            int? parsedFolderId = null;
+            var userId = GetCurrentUserId();
+            var isAdmin = IsAdmin();
 
+            int? parsedFolderId = null;
             if (!string.IsNullOrEmpty(folderId) && folderId != "null")
             {
-                if (int.TryParse(folderId, out int tempId))
-                {
-                    parsedFolderId = tempId;
-                }
-                else
-                {
-                    return BadRequest("Geçersiz folderId formatı");
-                }
+                if (int.TryParse(folderId, out int temp)) parsedFolderId = temp;
+                else return BadRequest("Invalid folderId format");
             }
 
+            Expression<Func<FileEntity, bool>> filter = isAdmin
+                ? (parsedFolderId.HasValue ? f => f.FolderId == parsedFolderId : f => f.FolderId == null)
+                : (parsedFolderId.HasValue ? f => f.FolderId == parsedFolderId && f.UserId == userId
+                                            : f => f.FolderId == null && f.UserId == userId);
+
             var list = await _uow.Files.GetAllAsync(
-                filter: parsedFolderId.HasValue ? f => f.FolderId == parsedFolderId : f => f.FolderId == null,
+                filter: filter,
                 orderBy: q => q.OrderByDescending(x => x.UploadedAt)
             );
 
@@ -104,23 +114,29 @@ public class FilesController : ControllerBase
                 FolderId = f.FolderId,
                 UploadedAt = f.UploadedAt,
                 LastOpenedAt = f.LastOpenedAt,
-                Url = $"{Request.Scheme}://{Request.Host}{f.RelativePath}"
+                Url = $"{Request.Scheme}://{Request.Host}/uploads/{f.StoredFileName}"
             });
 
             return Ok(result);
         }
         catch (Exception ex)
         {
-            return StatusCode(500, $"Sunucu hatası: {ex.Message}");
+            return StatusCode(500, $"Server error: {ex.Message}");
         }
     }
 
-    // Recent
     [HttpGet("recent")]
     public async Task<IActionResult> Recent([FromQuery] int limit = 8)
     {
+        var userId = GetCurrentUserId();
+        var isAdmin = IsAdmin();
+
+        Expression<Func<FileEntity, bool>> filter = isAdmin
+            ? f => f.LastOpenedAt != null
+            : f => f.LastOpenedAt != null && f.UserId == userId;
+
         var list = await _uow.Files.GetAllAsync(
-            filter: f => f.LastOpenedAt != null,
+            filter: filter,
             orderBy: q => q.OrderByDescending(x => x.LastOpenedAt)
         );
 
@@ -133,60 +149,71 @@ public class FilesController : ControllerBase
             FolderId = f.FolderId,
             UploadedAt = f.UploadedAt,
             LastOpenedAt = f.LastOpenedAt,
-            Url = $"{Request.Scheme}://{Request.Host}{f.RelativePath}"
+            Url = $"{Request.Scheme}://{Request.Host}/uploads/{f.StoredFileName}"
         });
 
         return Ok(result);
     }
 
-    // Mark as opened (Home > Son Açılanlar için)
     [HttpPatch("open/{id}")]
     public async Task<IActionResult> MarkOpened(int id)
     {
+        var userId = GetCurrentUserId();
         var entity = await _uow.Files.GetByIdAsync(id);
         if (entity == null) return NotFound();
+        if (!IsAdmin() && entity.UserId != userId) return Forbid();
 
         entity.LastOpenedAt = DateTime.UtcNow;
         _uow.Files.Update(entity);
         await _uow.SaveChangesAsync();
+
         return NoContent();
     }
 
-    // Download
     [HttpGet("download/{id}")]
     public async Task<IActionResult> Download(int id)
     {
+        var userId = GetCurrentUserId();
         var entity = await _uow.Files.GetByIdAsync(id);
         if (entity == null) return NotFound();
+        if (!IsAdmin() && entity.UserId != userId) return Forbid();
 
-        var fileName = entity.StoredFileName;
         var uploadsRoot = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
+        var fullPath = Path.Combine(uploadsRoot, entity.StoredFileName);
 
-        // 📌 Yine klasörü kontrol et
-        if (!Directory.Exists(uploadsRoot))
-        {
-            Directory.CreateDirectory(uploadsRoot);
-        }
+        if (!System.IO.File.Exists(fullPath)) return NotFound();
 
-        var full = Path.Combine(uploadsRoot, fileName);
-
-        if (!System.IO.File.Exists(full)) return NotFound();
-
-        return PhysicalFile(full, entity.ContentType, entity.FileName);
+        return PhysicalFile(fullPath, entity.ContentType, entity.FileName);
     }
 
-    // Delete (frontend'teki çöp kutusu için)
     [HttpDelete("{id}")]
     public async Task<IActionResult> Delete(int id)
     {
+        var userId = GetCurrentUserId();
         var entity = await _uow.Files.GetByIdAsync(id);
         if (entity == null) return NotFound();
+        if (!IsAdmin() && entity.UserId != userId) return Forbid();
 
-        var ok = await _storage.DeleteAsync(entity.StoredFileName);
-        if (!ok) return StatusCode(500, "Physical file could not be deleted.");
-
-        _uow.Files.Remove(entity);
+        entity.IsDeleted = true;
+        entity.DeletedAt = DateTime.UtcNow;
+        _uow.Files.Update(entity);
         await _uow.SaveChangesAsync();
+
         return NoContent();
+    }
+
+    // 🔧 Helper methods
+    private int GetCurrentUserId()
+    {
+        var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrEmpty(userIdClaim) || !int.TryParse(userIdClaim, out var userId))
+            throw new UnauthorizedAccessException("Invalid user ID in token");
+        return userId;
+    }
+
+    private bool IsAdmin()
+    {
+        var roleClaim = User.FindFirst(ClaimTypes.Role)?.Value;
+        return roleClaim == "Admin";
     }
 }

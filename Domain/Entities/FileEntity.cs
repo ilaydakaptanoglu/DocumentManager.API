@@ -20,9 +20,18 @@ public class FileEntity
 
     public long Size { get; set; }
 
+    // Existing folder relationship
     public int? FolderId { get; set; }
     public Folder? Folder { get; set; }
 
+    // NEW: User ownership
+    public int? UserId { get; set; }
+    public User? User { get; set; }
+
     public DateTime UploadedAt { get; set; } = DateTime.UtcNow;
     public DateTime? LastOpenedAt { get; set; }
+
+    // NEW: Soft delete fields
+    public bool IsDeleted { get; set; } = false;
+    public DateTime? DeletedAt { get; set; }
 }
