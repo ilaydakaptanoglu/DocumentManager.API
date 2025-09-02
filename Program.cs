@@ -1,230 +1,231 @@
-﻿using DocumentManager.API.Data;
+﻿using DocumentManager.API.Domain.DTOs;
 using DocumentManager.API.Domain.Entities;
 using DocumentManager.API.Infrastructure.Repositories;
 using DocumentManager.API.Infrastructure.Storage;
-using DocumentManager.API.Services.Auth;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.IdentityModel.Tokens;
-using System.Text;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using System.Linq.Expressions;
+using System.Security.Claims;
 
-var builder = WebApplication.CreateBuilder(args);
+namespace DocumentManager.API.Controllers;
 
-// ----------------------------
-// DbContext (MySQL)
-// ----------------------------
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
-    ?? throw new InvalidOperationException("MySQL connection string not configured");
-
-builder.Services.AddDbContext<ApplicationDbContext>(options =>
-    options.UseMySql(connectionString, ServerVersion.AutoDetect(connectionString)));
-
-// ----------------------------
-// Repository Pattern
-// ----------------------------
-builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
-builder.Services.AddScoped<IFileStorage, FileStorage>();
-
-// ----------------------------
-// Authentication Services
-// ----------------------------
-builder.Services.AddScoped<ITokenService, TokenService>();
-builder.Services.AddScoped<IAuthService, AuthService>();
-
-// ----------------------------
-// JWT Authentication Configuration
-// ----------------------------
-var jwtSecret = builder.Configuration["Jwt:Secret"] ?? throw new InvalidOperationException("JWT Secret not configured");
-var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? "DocumentManager";
-var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "DocumentManager";
-
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
-            ValidateIssuer = true,
-            ValidIssuer = jwtIssuer,
-            ValidateAudience = true,
-            ValidAudience = jwtAudience,
-            ValidateLifetime = true,
-            ClockSkew = TimeSpan.Zero
-        };
-
-        options.Events = new JwtBearerEvents
-        {
-            OnMessageReceived = context =>
-            {
-                var accessToken = context.Request.Query["access_token"];
-                if (!string.IsNullOrEmpty(accessToken))
-                {
-                    context.Token = accessToken;
-                }
-                return Task.CompletedTask;
-            },
-            OnAuthenticationFailed = context =>
-            {
-                if (context.Exception.GetType() == typeof(SecurityTokenExpiredException))
-                {
-                    context.Response.Headers.Append("Token-Expired", "true");
-                }
-                return Task.CompletedTask;
-            }
-        };
-    });
-
-builder.Services.AddAuthorization();
-
-// ----------------------------
-// Controllers & Swagger
-// ----------------------------
-builder.Services.AddControllers();
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(c =>
+[ApiController]
+[Route("api/[controller]")]
+[Authorize] // 🔒 Authentication required
+public class FilesController : ControllerBase
 {
-    c.SwaggerDoc("v1", new() { Title = "DocumentManager API", Version = "v1" });
+    private readonly IUnitOfWork _uow;
+    private readonly IFileStorage _storage;
 
-    c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+    public FilesController(IUnitOfWork uow, IFileStorage storage)
     {
-        Description = "JWT Authorization header using the Bearer scheme. Enter 'Bearer' [space] and then your token",
-        Name = "Authorization",
-        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
-        Type = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
-        Scheme = "Bearer"
-    });
-
-    c.AddSecurityRequirement(new Microsoft.OpenApi.Models.OpenApiSecurityRequirement
-    {
-        {
-            new Microsoft.OpenApi.Models.OpenApiSecurityScheme
-            {
-                Reference = new Microsoft.OpenApi.Models.OpenApiReference
-                {
-                    Type = Microsoft.OpenApi.Models.ReferenceType.SecurityScheme,
-                    Id = "Bearer"
-                }
-            },
-            Array.Empty<string>()
-        }
-    });
-});
-
-// ----------------------------
-// CORS Configuration
-// ----------------------------
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("AllowReactApp", policy =>
-    {
-        policy.WithOrigins("http://localhost:5173", "http://localhost:3000")
-              .AllowAnyHeader()
-              .AllowAnyMethod()
-              .AllowCredentials();
-    });
-});
-
-var app = builder.Build();
-
-// ----------------------------
-// HTTP pipeline
-// ----------------------------
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
-    app.UseDeveloperExceptionPage();
-}
-
-app.UseHttpsRedirection();
-app.UseCors("AllowReactApp");
-app.UseStaticFiles();
-
-app.UseAuthentication();
-app.UseAuthorization();
-
-app.MapControllers();
-
-// ----------------------------
-// Database migration & seeding
-// ----------------------------
-if (app.Environment.IsDevelopment())
-{
-    using var scope = app.Services.CreateScope();
-    var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-
-    try
-    {
-        context.Database.Migrate();
-        await SeedDefaultUsers(context);
+        _uow = uow;
+        _storage = storage;
     }
-    catch (Exception ex)
+
+    [HttpPost("upload")]
+    [RequestSizeLimit(1073741824)] // 1GB
+    public async Task<IActionResult> Upload([FromForm] List<IFormFile> files, [FromForm] int? folderId)
     {
-        var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
-        logger.LogError(ex, "An error occurred while migrating or seeding the database.");
+        if (files == null || files.Count == 0)
+            return BadRequest("No files provided.");
+
+        var userId = GetCurrentUserId();
+
+        if (folderId.HasValue)
+        {
+            var folder = await _uow.Folders.GetByIdAsync(folderId.Value);
+            if (folder == null) return NotFound("Folder not found");
+            if (!IsAdmin() && folder.UserId != userId)
+                return Forbid("You don't have permission to upload to this folder.");
+        }
+
+        var uploadsRoot = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
+        if (!Directory.Exists(uploadsRoot)) Directory.CreateDirectory(uploadsRoot);
+
+        var results = new List<FileDto>();
+
+        foreach (var f in files)
+        {
+            var (stored, relative) = await _storage.SaveAsync(f);
+
+            var entity = new FileEntity
+            {
+                FileName = f.FileName,
+                StoredFileName = stored,
+                RelativePath = relative,
+                ContentType = f.ContentType ?? "application/octet-stream",
+                Size = f.Length,
+                FolderId = folderId,
+                UserId = userId,
+                UploadedAt = DateTime.UtcNow
+            };
+
+            await _uow.Files.AddAsync(entity);
+            await _uow.SaveChangesAsync();
+
+            results.Add(new FileDto
+            {
+                Id = entity.Id,
+                FileName = entity.FileName,
+                ContentType = entity.ContentType,
+                Size = entity.Size,
+                FolderId = entity.FolderId,
+                UploadedAt = entity.UploadedAt,
+                LastOpenedAt = entity.LastOpenedAt,
+                UserId = entity.UserId,
+                UserName = (await _uow.Users.GetByIdAsync(entity.UserId))?.Username ?? "Unknown",
+                Url = $"{Request.Scheme}://{Request.Host}/uploads/{entity.StoredFileName}"
+            });
+        }
+
+        return Ok(results);
     }
-}
 
-app.Run();
-
-// ----------------------------
-// Seed default users
-// ----------------------------
-async Task SeedDefaultUsers(ApplicationDbContext context)
-{
-    if (!context.Users.Any())
+    [HttpGet]
+    public async Task<IActionResult> List([FromQuery] string? folderId = null)
     {
-        // Mevcut rollerin kontrolü
-        var roles = await context.Roles.ToListAsync();
-
-        var adminRole = roles.FirstOrDefault(r => r.Name == "Admin");
-        if (adminRole == null)
+        try
         {
-            adminRole = new Role { Name = "Admin" };
-            await context.Roles.AddAsync(adminRole);
-            await context.SaveChangesAsync();
-        }
+            var userId = GetCurrentUserId();
+            var isAdmin = IsAdmin();
 
-        var userRole = roles.FirstOrDefault(r => r.Name == "User");
-        if (userRole == null)
-        {
-            userRole = new Role { Name = "User" };
-            await context.Roles.AddAsync(userRole);
-            await context.SaveChangesAsync();
-        }
-
-      var users = new[]
-        {
-            new User
+            int? parsedFolderId = null;
+            if (!string.IsNullOrEmpty(folderId) && folderId != "null")
             {
-                Username = "admin",
-                Email = "admin@dochub.com",
-                PasswordHash = BCrypt.Net.BCrypt.HashPassword("admin123"),
-                Roles = new List<Role> { adminRole },
-                FirstName = "Admin",
-                LastName = "User",
-                CreatedAt = DateTime.UtcNow,
-                IsActive = true
-            },
-            new User
-            {
-                Username = "user",
-                Email = "user@dochub.com",
-                PasswordHash = BCrypt.Net.BCrypt.HashPassword("user123"),
-                Roles = new List<Role> { userRole },
-                FirstName = "Default",
-                LastName = "User",
-                CreatedAt = DateTime.UtcNow,
-                IsActive = true
+                if (int.TryParse(folderId, out int temp)) parsedFolderId = temp;
+                else return BadRequest("Invalid folderId format");
             }
-        };
 
-        await context.Users.AddRangeAsync(users);
-        await context.SaveChangesAsync();
+            // 🔧 Admin tüm dosyalara, kullanıcı kendi dosyalarına erişebilir
+            Expression<Func<FileEntity, bool>> filter = parsedFolderId.HasValue
+                ? (isAdmin 
+                    ? f => f.FolderId == parsedFolderId 
+                    : f => f.FolderId == parsedFolderId && f.UserId == userId)
+                : (isAdmin 
+                    ? f => f.FolderId == null 
+                    : f => f.FolderId == null && f.UserId == userId);
 
-        Console.WriteLine("✅ Default users created:");
-        Console.WriteLine("👑 Admin: admin/admin123");
-        Console.WriteLine("👤 User: user/user123");
+            var list = await _uow.Files.GetAllAsync(
+                filter: filter,
+                orderBy: q => q.OrderByDescending(x => x.UploadedAt),
+                includeProperties: "User" // User bilgisi gelsin
+            );
+
+            var result = list.Select(f => new FileDto
+            {
+                Id = f.Id,
+                FileName = f.FileName,
+                ContentType = f.ContentType,
+                Size = f.Size,
+                FolderId = f.FolderId,
+                UploadedAt = f.UploadedAt,
+                LastOpenedAt = f.LastOpenedAt,
+                UserId = f.UserId,
+                UserName = f.User?.Username ?? "Unknown",
+                Url = $"{Request.Scheme}://{Request.Host}/uploads/{f.StoredFileName}"
+            });
+
+            return Ok(result);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Server error: {ex.Message}");
+        }
+    }
+
+    [HttpGet("recent")]
+    public async Task<IActionResult> Recent([FromQuery] int limit = 8)
+    {
+        var userId = GetCurrentUserId();
+        var isAdmin = IsAdmin();
+
+        Expression<Func<FileEntity, bool>> filter = isAdmin
+            ? f => f.LastOpenedAt != null
+            : f => f.LastOpenedAt != null && f.UserId == userId;
+
+        var list = await _uow.Files.GetAllAsync(
+            filter: filter,
+            orderBy: q => q.OrderByDescending(x => x.LastOpenedAt),
+            includeProperties: "User"
+        );
+
+        var result = list.Take(limit).Select(f => new FileDto
+        {
+            Id = f.Id,
+            FileName = f.FileName,
+            ContentType = f.ContentType,
+            Size = f.Size,
+            FolderId = f.FolderId,
+            UploadedAt = f.UploadedAt,
+            LastOpenedAt = f.LastOpenedAt,
+            UserId = f.UserId,
+            UserName = f.User?.Username ?? "Unknown",
+            Url = $"{Request.Scheme}://{Request.Host}/uploads/{f.StoredFileName}"
+        });
+
+        return Ok(result);
+    }
+
+    [HttpPatch("open/{id}")]
+    public async Task<IActionResult> MarkOpened(int id)
+    {
+        var userId = GetCurrentUserId();
+        var entity = await _uow.Files.GetByIdAsync(id);
+        if (entity == null) return NotFound();
+        if (!IsAdmin() && entity.UserId != userId) return Forbid();
+
+        entity.LastOpenedAt = DateTime.UtcNow;
+        _uow.Files.Update(entity);
+        await _uow.SaveChangesAsync();
+
+        return NoContent();
+    }
+
+    [HttpGet("download/{id}")]
+    public async Task<IActionResult> Download(int id)
+    {
+        var userId = GetCurrentUserId();
+        var entity = await _uow.Files.GetByIdAsync(id);
+        if (entity == null) return NotFound();
+        if (!IsAdmin() && entity.UserId != userId) return Forbid();
+
+        var uploadsRoot = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
+        var fullPath = Path.Combine(uploadsRoot, entity.StoredFileName);
+
+        if (!System.IO.File.Exists(fullPath)) return NotFound();
+
+        return PhysicalFile(fullPath, entity.ContentType, entity.FileName);
+    }
+
+    [HttpDelete("{id}")]
+    public async Task<IActionResult> Delete(int id)
+    {
+        var userId = GetCurrentUserId();
+        var entity = await _uow.Files.GetByIdAsync(id);
+        if (entity == null) return NotFound();
+        if (!IsAdmin() && entity.UserId != userId) return Forbid();
+
+        entity.IsDeleted = true;
+        entity.DeletedAt = DateTime.UtcNow;
+        _uow.Files.Update(entity);
+        await _uow.SaveChangesAsync();
+
+        return NoContent();
+    }
+
+    // 🔧 Helper methods
+    private int GetCurrentUserId()
+    {
+        var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrEmpty(userIdClaim) || !int.TryParse(userIdClaim, out var userId))
+            throw new UnauthorizedAccessException("Invalid user ID in token");
+        return userId;
+    }
+
+    private bool IsAdmin()
+    {
+        var roleClaim = User.FindFirst(ClaimTypes.Role)?.Value;
+        return roleClaim == "Admin";
     }
 }
