@@ -194,8 +194,7 @@ async Task SeedDefaultUsers(ApplicationDbContext context)
             await context.SaveChangesAsync();
         }
 
-        // Kullanıcıları oluştur
-        var users = new[]
+      var users = new[]
         {
             new User
             {
@@ -203,6 +202,8 @@ async Task SeedDefaultUsers(ApplicationDbContext context)
                 Email = "admin@dochub.com",
                 PasswordHash = BCrypt.Net.BCrypt.HashPassword("admin123"),
                 Roles = new List<Role> { adminRole },
+                FirstName = "Admin",
+                LastName = "User",
                 CreatedAt = DateTime.UtcNow,
                 IsActive = true
             },
@@ -212,6 +213,8 @@ async Task SeedDefaultUsers(ApplicationDbContext context)
                 Email = "user@dochub.com",
                 PasswordHash = BCrypt.Net.BCrypt.HashPassword("user123"),
                 Roles = new List<Role> { userRole },
+                FirstName = "Default",
+                LastName = "User",
                 CreatedAt = DateTime.UtcNow,
                 IsActive = true
             }
